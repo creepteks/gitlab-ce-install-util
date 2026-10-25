@@ -23,7 +23,7 @@ Internet ──443/80──► Caddy (Let's Encrypt, auto-renew) ──http─�
 ## Prerequisites
 
 - Ubuntu 22.04 or 24.04. **At least 4 vCPU and 8 GB RAM** recommended (4 GB works with the memory tweaks in the compose file). SSD storage.
-- A DNS **A record** `sub.domain.com → <server public IP>` (and AAAA if you use IPv6).
+- A DNS **A record** `sub.domain.com → <server public IP>` (and AAAA if you use IPv6). `install.sh` checks that the record matches one of the server's interface IPs or its outbound IP. If the server sits behind NAT, an elastic/floating IP, or an outbound proxy/VPN, set `PUBLIC_IP=` in `.env`; this replaces auto-detection.
 - Ports **80, 443 (tcp+udp), 2222** open in any cloud security group. Port 80 is needed for the ACME HTTP-01 challenge.
 
 ## Install

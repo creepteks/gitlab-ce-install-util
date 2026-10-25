@@ -108,6 +108,62 @@ else
   docker compose version >/dev/null 2>&1 || die "docker compose still unavailable after install"
 fi
 
+# --- DNS sanity check -----------------------------------------------------------
+# The domain's A record(s) must point at this server, or Let's Encrypt fails.
+# "This server" means any of:
+#   - PUBLIC_IP from .env (if set, it replaces auto-detection; space/comma list allowed)
+#   - an IPv4 address on a local interface (covers multiple IPs, floating IPs bound to the NIC)
+#   - the outbound IP seen by ipify, fetched without any HTTP proxy
+# Behind 1:1 NAT (AWS elastic IP, GCP external IP) none of the auto-detected
+# addresses may equal the public one; set PUBLIC_IP in that case.
+
+ipv4_only() { grep -Eo '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || true; }
+
+check_dns() {
+  log "Checking DNS for $GITLAB_DOMAIN"
+
+  local dns_ips expected source
+  # +short may print CNAME targets first; keep only the addresses.
+  dns_ips=$(dig +short A "$GITLAB_DOMAIN" | ipv4_only | sort -u)
+
+  if [[ -n "${PUBLIC_IP:-}" ]]; then
+    expected=$(tr ', ' '\n\n' <<<"$PUBLIC_IP" | ipv4_only | sort -u)
+    [[ -n "$expected" ]] || die "PUBLIC_IP='$PUBLIC_IP' in .env is not a valid IPv4 address"
+    source="PUBLIC_IP (.env)"
+  else
+    local local_ips outbound_ip
+    local_ips=$(ip -4 -o addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]}' | sort -u)
+    outbound_ip=$(curl -fsS4 --noproxy '*' --max-time 10 https://api.ipify.org 2>/dev/null | ipv4_only)
+    expected=$(printf '%s\n%s\n' "$local_ips" "$outbound_ip" | sed '/^$/d' | sort -u)
+    source="auto-detected"
+  fi
+
+  if [[ -z "$dns_ips" ]]; then
+    die "$GITLAB_DOMAIN has no A record — create one pointing at this server's public IP first
+       ($source addresses: $(echo $expected))"
+  fi
+
+  local match
+  match=$(comm -12 <(echo "$dns_ips") <(echo "$expected"))
+  if [[ -n "$match" ]]; then
+    skip "$GITLAB_DOMAIN -> $(echo $match) matches this server ($source)"
+    return
+  fi
+
+  echo "WARNING: $GITLAB_DOMAIN does not resolve to any address of this server."
+  echo "    DNS A record(s):        $(echo $dns_ips)"
+  if [[ -n "${PUBLIC_IP:-}" ]]; then
+    echo "    PUBLIC_IP (.env):       $(echo $expected)"
+  else
+    echo "    Local interface IPv4:   $(echo ${local_ips:-none})"
+    echo "    Outbound IP (ipify):    ${outbound_ip:-unavailable}"
+    echo "    If the server is behind NAT/an elastic IP, set PUBLIC_IP=<dns ip> in .env."
+  fi
+  echo "    Cloudflare-proxied records (orange cloud) must be set to DNS only for Let's Encrypt HTTP-01."
+  read -rp "Continue anyway? [y/N] " ans || ans=""
+  [[ "$ans" =~ ^[Yy]$ ]] || exit 1
+}
+
 # --- Existing deployments -----------------------------------------------------
 
 project=$(docker compose config --format json 2>/dev/null | jq -r '.name // empty')
@@ -132,17 +188,7 @@ if (( stack_running && ! REDEPLOY )); then
   docker compose ps --format 'table {{.Service}}\t{{.Image}}\t{{.Status}}'
   echo "    Use ./upgrade.sh to change versions, or ./install.sh --redeploy to pull and recreate."
 else
-  log "Checking DNS for $GITLAB_DOMAIN"
-  public_ip=$(curl -fsS4 https://api.ipify.org || true)
-  dns_ip=$(dig +short A "$GITLAB_DOMAIN" | tail -n1)
-  if [[ -z "$dns_ip" ]]; then
-    die "$GITLAB_DOMAIN has no A record — create it (pointing at ${public_ip:-this server}) first"
-  elif [[ -n "$public_ip" && "$dns_ip" != "$public_ip" ]]; then
-    echo "WARNING: $GITLAB_DOMAIN resolves to $dns_ip, but this server's public IP is $public_ip."
-    echo "         Let's Encrypt will fail unless that is a proxy/NAT you expect."
-    read -rp "Continue anyway? [y/N] " ans; [[ "$ans" =~ ^[Yy]$ ]] || exit 1
-  fi
-
+  check_dns
   # Fail early if something other than this stack already holds the needed ports.
   if [[ -z "$(docker compose ps -q 2>/dev/null)" ]]; then
     busy=$(ss -Hltnp "( sport = :80 or sport = :443 or sport = :${GITLAB_SSH_PORT} )" 2>/dev/null || true)
