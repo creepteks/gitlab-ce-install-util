@@ -1,0 +1,22 @@
+{
+	email {$ACME_EMAIL}
+}
+
+{$GITLAB_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
+
+	# Caddy sets X-Forwarded-For/-Proto/-Host itself. It has no request body
+	# limit, so large LFS pushes and uploads work. Streaming is not buffered.
+	reverse_proxy gitlab:80 {
+		flush_interval -1
+		transport http {
+			read_timeout 10m
+			write_timeout 10m
+		}
+	}
+}

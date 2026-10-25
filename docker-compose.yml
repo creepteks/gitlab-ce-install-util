@@ -1,0 +1,78 @@
+name: gitlab
+
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    environment:
+      GITLAB_DOMAIN: ${GITLAB_DOMAIN:?set GITLAB_DOMAIN in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data        # certificates + ACME account — must persist
+      - caddy_config:/config
+    networks:
+      gitlab_net:
+        ipv4_address: 172.30.0.2
+    depends_on:
+      - gitlab
+
+  gitlab:
+    image: gitlab/gitlab-ce:${GITLAB_VERSION:?set GITLAB_VERSION in .env}
+    restart: unless-stopped
+    hostname: ${GITLAB_DOMAIN}
+    shm_size: 256m
+    environment:
+      TZ: ${TZ:-UTC}
+      # Applied on every container start (gitlab-ctl reconfigure). This is the
+      # single source of truth for GitLab settings; leave /etc/gitlab/gitlab.rb unchanged.
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'https://${GITLAB_DOMAIN}'
+
+        # TLS terminates at Caddy; bundled nginx serves plain HTTP inside the network.
+        letsencrypt['enable'] = false
+        nginx['listen_port'] = 80
+        nginx['listen_https'] = false
+        nginx['proxy_set_headers'] = {
+          "X-Forwarded-Proto" => "https",
+          "X-Forwarded-Ssl"   => "on"
+        }
+        # Trust Caddy so GitLab logs and rate-limits use the real client IP.
+        nginx['real_ip_trusted_addresses'] = ['172.30.0.0/24']
+        nginx['real_ip_header'] = 'X-Forwarded-For'
+        nginx['real_ip_recursive'] = 'on'
+        gitlab_rails['trusted_proxies'] = ['172.30.0.0/24']
+
+        # Clone URLs show the SSH port that is published on the host.
+        gitlab_rails['gitlab_shell_ssh_port'] = ${GITLAB_SSH_PORT:-2222}
+
+        # Local backups (used by upgrade.sh). Keep 7 days.
+        gitlab_rails['backup_keep_time'] = 604800
+
+        # Optional, on small servers (<8 GB RAM) uncomment to save memory:
+        # prometheus_monitoring['enable'] = false
+        # puma['worker_processes'] = 2
+        # sidekiq['concurrency'] = 10
+    ports:
+      - "${GITLAB_SSH_PORT:-2222}:22"
+    volumes:
+      - ${GITLAB_HOME:-/srv/gitlab}/config:/etc/gitlab
+      - ${GITLAB_HOME:-/srv/gitlab}/logs:/var/log/gitlab
+      - ${GITLAB_HOME:-/srv/gitlab}/data:/var/opt/gitlab
+    networks:
+      gitlab_net:
+        ipv4_address: 172.30.0.10
+
+networks:
+  gitlab_net:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  caddy_data:
+  caddy_config:
