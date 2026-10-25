@@ -1,0 +1,2 @@
+# These files run on Linux; CRLF breaks bash shebangs and Caddy/compose parsing.
+* text=auto eol=lf
