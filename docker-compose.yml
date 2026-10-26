@@ -13,8 +13,10 @@ services:
       ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data        # certificates + ACME account — must persist
-      - caddy_config:/config
+      # Certificates + ACME account. Bind-mounted next to GitLab data so they are
+      # backed up with it and survive `docker compose down -v`.
+      - ${GITLAB_HOME:?set GITLAB_HOME in .env}/caddy/data:/data
+      - ${GITLAB_HOME:?set GITLAB_HOME in .env}/caddy/config:/config
     networks:
       gitlab_net:
         ipv4_address: 172.30.0.2
@@ -23,9 +25,14 @@ services:
 
   gitlab:
     image: gitlab/gitlab-ce:${GITLAB_VERSION:?set GITLAB_VERSION in .env}
+    # Never pull implicitly on `up`; only upgrade.sh changes the version.
+    pull_policy: missing
     restart: unless-stopped
     hostname: ${GITLAB_DOMAIN}
     shm_size: 256m
+    # Docker's default 10s stop timeout SIGKILLs PostgreSQL mid-write.
+    # gitlab-ctl stop needs time to flush and shut down cleanly.
+    stop_grace_period: 5m
     environment:
       TZ: ${TZ:-UTC}
       # Applied on every container start (gitlab-ctl reconfigure). This is the
@@ -50,8 +57,9 @@ services:
         # Clone URLs show the SSH port that is published on the host.
         gitlab_rails['gitlab_shell_ssh_port'] = ${GITLAB_SSH_PORT:-2222}
 
-        # Local backups (used by upgrade.sh). Keep 7 days.
-        gitlab_rails['backup_keep_time'] = 604800
+        # Backup archives are moved into bundles by backup.sh/upgrade.sh, which do
+        # their own retention. 0 = GitLab never deletes archives on its own.
+        gitlab_rails['backup_keep_time'] = 0
 
         # Optional, on small servers (<8 GB RAM) uncomment to save memory:
         # prometheus_monitoring['enable'] = false
@@ -59,10 +67,12 @@ services:
         # sidekiq['concurrency'] = 10
     ports:
       - "${GITLAB_SSH_PORT:-2222}:22"
+    # Bind mounts (not named volumes): `docker compose down -v` cannot delete them,
+    # and a missing/mistyped GITLAB_HOME stops compose instead of starting empty.
     volumes:
-      - ${GITLAB_HOME:-/srv/gitlab}/config:/etc/gitlab
-      - ${GITLAB_HOME:-/srv/gitlab}/logs:/var/log/gitlab
-      - ${GITLAB_HOME:-/srv/gitlab}/data:/var/opt/gitlab
+      - ${GITLAB_HOME:?set GITLAB_HOME in .env}/config:/etc/gitlab
+      - ${GITLAB_HOME:?set GITLAB_HOME in .env}/logs:/var/log/gitlab
+      - ${GITLAB_HOME:?set GITLAB_HOME in .env}/data:/var/opt/gitlab
     networks:
       gitlab_net:
         ipv4_address: 172.30.0.10
@@ -72,7 +82,3 @@ networks:
     ipam:
       config:
         - subnet: 172.30.0.0/24
-
-volumes:
-  caddy_data:
-  caddy_config:

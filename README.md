@@ -7,7 +7,7 @@ Internet ──443/80──► Caddy (Let's Encrypt, auto-renew) ──http─�
 
 - **GitLab CE** official `gitlab/gitlab-ce` image. Its version is **pinned** in `.env` (currently `19.5.1-ce.0`, the latest release as of 2026-10-21).
 - **Caddy 2** gets and renews the Let's Encrypt certificate itself, sends HTTP to HTTPS, and adds HSTS.
-- All state lives in `/srv/gitlab/{config,data,logs}` plus the `caddy_data` volume (certificates). You can delete the containers at any time without losing data.
+- All state lives in `/srv/gitlab`: GitLab config, data and logs, Caddy certificates, and backup bundles. You can delete the containers at any time without losing data (see [Data safety](#data-safety-what-can-and-cannot-lose-data)).
 - Docker's `restart: unless-stopped` and the systemd-managed `docker.service` bring everything back after a reboot.
 
 ## Files
@@ -17,8 +17,11 @@ Internet ──443/80──► Caddy (Let's Encrypt, auto-renew) ──http─�
 | `docker-compose.yml` | Both services. All GitLab settings are in `GITLAB_OMNIBUS_CONFIG` |
 | `Caddyfile` | Reverse proxy and TLS |
 | `.env.example` | Domain, email, pinned version, paths. Copy it to `.env` |
-| `install.sh` | Installs Docker, checks DNS and the firewall, starts the stack, installs the weekly patch timer |
-| `upgrade.sh` | Upgrades along GitLab's required upgrade path, with a backup before each step |
+| `install.sh` | Installs Docker, checks DNS and the firewall, starts the stack (or restores a bundle with `--restore`), installs the backup and patch timers |
+| `upgrade.sh` | Upgrades along GitLab's required upgrade path, with a verified backup before each step |
+| `backup.sh` | Writes a verified, checksummed backup bundle (`--migrate` when moving servers) |
+| `restore.sh` | Restores a bundle on this or a new server and verifies the result |
+| `lib.sh` | Shared safety checks used by all scripts |
 
 ## Prerequisites
 
@@ -41,14 +44,47 @@ The script prints the initial `root` password. Log in at `https://sub.domain.com
 
 Check the certificate: `curl -vI https://sub.domain.com 2>&1 | grep -E 'issuer|HTTP/'` should show Let's Encrypt and a 302 to `/users/sign_in`.
 
+## Data safety: what can and cannot lose data
+
+All state lives under `GITLAB_HOME` (default `/srv/gitlab`) as **bind mounts**:
+
+| Path | Contents |
+|---|---|
+| `data/` | PostgreSQL, Git repositories (Gitaly), uploads, LFS, CI artifacts, packages, Redis |
+| `config/` | `gitlab.rb`, **`gitlab-secrets.json`**, SSH host keys |
+| `logs/` | logs |
+| `caddy/` | TLS certificates and ACME account |
+| `bundles/` | backup bundles (or `BACKUP_DIR`) |
+
+Containers are disposable. `docker compose down`, `down -v`, `rm`, recreating, image prunes and reboots do **not** touch these directories. The scripts refuse to go on whenever continuing could lose data:
+
+| Risk | Guard |
+|---|---|
+| `GITLAB_HOME` changed or mistyped, so an empty GitLab starts and the real data is orphaned | Compose fails if it is unset. The scripts compare it with the existing container's mount and stop on a mismatch |
+| Image newer than the data, so an unplanned upgrade runs with no backup | The scripts compare the data's own `gitlab-rails/VERSION` with `GITLAB_VERSION` and refuse. `pull_policy: missing` prevents surprise pulls |
+| Image older than the data (a downgrade), which corrupts the DB | Same check. Downgrades are refused |
+| Docker's 10 s stop timeout kills PostgreSQL mid-write | `stop_grace_period: 5m` |
+| A hop starts before the previous version's background migrations finish, or after one failed | `upgrade.sh` waits for 0 pending migrations. It stops on any *failed* one, and also stops if their status can't be read |
+| Backup lacks `gitlab-secrets.json`, so CI variables, 2FA and tokens can't be decrypted after a restore | Every bundle includes `/etc/gitlab`. Creation fails if the secrets file is missing |
+| Corrupt or truncated backup that is only noticed on restore day | Every `.gz` member is `gzip -t`-tested, and the DB dump and version are checked. The bundle gets `SHA256SUMS`, which are verified before any restore |
+| Backup reported OK, but the restore is silently partial | Row counts (projects, users, namespaces, issues, MRs, notes) are recorded at backup time. They are compared after a restore and after every upgrade hop. `gitlab:doctor:secrets` checks decryption |
+| Upgrade fails halfway and automation keeps going, or someone "rolls back" by setting the old tag | A `.upgrade-in-progress` marker blocks **all** scripts and timers until a person resolves it. The only rollback is through `restore.sh` |
+| Restore runs over existing data by mistake | `restore.sh` refuses without `--force`. With `--force`, the old `data/` and `config/` are **moved** aside, never deleted |
+| Two maintenance jobs at once (timer + manual run) | One global `flock` |
+| Disk fills up during a backup or restore | Free space is checked up front. A failed bundle is deleted, so it can't later pose as valid |
+| Certificates in Caddy named volumes from earlier versions of this stack | Copied once into the bind mount before Caddy is recreated |
+
+Not covered: failure of the disk holding `GITLAB_HOME`. That is why bundles must be copied **off the server**. If you configure external object storage later, back it up separately.
+
 ## Upgrading
 
-GitLab does **not** support jumping across minor versions at will. You must stop at the "required stops" (e.g. 18.11 → 19.2 → 19.5 …), and each stop's background migrations must finish before the next step. For that reason this setup never uses the `latest` tag. `upgrade.sh` does the work:
+GitLab does **not** support jumping across minor versions at will. You must stop at the "required stops" (e.g. 18.11 → 19.2 → 19.5 …), and each stop's background migrations must finish before the next step. For that reason this setup never uses the `latest` tag. `upgrade.sh` gets the release list from Docker Hub and the required stops from GitLab's [`config/upgrade_path.yml`](https://gitlab.com/gitlab-org/gitlab/-/blob/master/config/upgrade_path.yml), then does each hop like this:
 
-1. Gets the list of releases from Docker Hub and the required stops from GitLab's own [`config/upgrade_path.yml`](https://gitlab.com/gitlab-org/gitlab/-/blob/master/config/upgrade_path.yml).
-2. Plans the path: newest patch of the current minor → each required stop (its newest patch) → newest release.
-3. For each step it waits for background migrations, saves `/etc/gitlab` (which holds **`gitlab-secrets.json`, not included in GitLab backups**), runs `gitlab-backup create`, changes the pinned version in `.env`, pulls the image, restarts GitLab, waits for the healthcheck, and runs `gitlab:check`.
-4. Updates Caddy and removes old images.
+1. Checks GitLab is healthy. Waits until batched background migrations are finished, and aborts if any **failed**.
+2. Pulls the new image first, so a registry outage changes nothing.
+3. Writes a verified backup bundle (see below).
+4. Writes the `.upgrade-in-progress` marker, pins the new version in `.env`, and recreates GitLab.
+5. Waits for health (up to 60 min). Then confirms that the running version and the data version equal the target, that row counts did not drop, and runs `gitlab:check`. Only then does it remove the marker and move to the next hop.
 
 ```bash
 sudo ./upgrade.sh --dry-run       # show the plan only
@@ -57,33 +93,86 @@ sudo ./upgrade.sh --one-hop       # one step at a time
 sudo ./upgrade.sh --patch-only    # security/bug-fix patches only (same minor)
 ```
 
-**Automatic security patches:** `install.sh` enables `gitlab-patch-upgrade.timer` (Sundays 03:30). It runs `upgrade.sh --patch-only --yes`. Patch releases are where GitLab ships its security fixes, and they never include breaking changes. Minor and major upgrades stay **manual** on purpose: read the [release notes / upgrade notes](https://docs.gitlab.com/update/versions/) first.
+**If a hop fails**, the data is untouched on disk and the pre-upgrade bundle path is printed. **Do not set the old version back in `.env`**: the database may already be migrated, and an older GitLab on a newer schema corrupts it. Instead, do one of the following:
+- Often the new version only needs a fix and `docker compose restart gitlab`. Once it is healthy and `gitlab:check` passes, run `rm /srv/gitlab/.upgrade-in-progress`.
+- Or roll back fully with `sudo ./restore.sh <pre-upgrade bundle> --force`. This restores the old version and clears the marker.
+
+**Automatic security patches:** `install.sh` enables `gitlab-patch-upgrade.timer` (Sundays 03:30). It runs `upgrade.sh --patch-only --yes`, with the same backup and checks as above. Patch releases are where GitLab ships its security fixes. Minor and major upgrades stay **manual** on purpose: read the [upgrade notes](https://docs.gitlab.com/update/versions/) first.
 
 ```bash
-systemctl list-timers gitlab-patch-upgrade.timer
+systemctl list-timers 'gitlab-*'
 journalctl -u gitlab-patch-upgrade.service -e
 sudo systemctl disable --now gitlab-patch-upgrade.timer   # opt out
 ```
 
-To get notices of new security releases, subscribe at https://about.gitlab.com/company/contact/ (Security Notices) or watch the [releases RSS](https://about.gitlab.com/security-releases.xml). GitLab's admin area also shows a version-check badge.
+For notices of new security releases, subscribe at https://about.gitlab.com/company/contact/ (Security Notices) or watch the [security releases RSS](https://about.gitlab.com/security-releases.xml).
 
 ## Backup and restore
 
-- Automatic backups are taken before each upgrade. You can also run `docker compose exec gitlab gitlab-backup create` from cron, e.g. daily.
-- **Copy `/srv/gitlab/data/backups/` and `/srv/gitlab/config-backups/` off the server.** A backup on the same disk is not a backup.
+A **bundle** is one directory with everything needed to rebuild the instance, here or on another server:
 
-Restore (the version must match the backup exactly):
+```
+gitlab-20261026T021500Z-19.5.1-scheduled/
+  scheduled_..._19.5.1_gitlab_backup.tar   DB, repositories, uploads, LFS, artifacts, packages, ...
+  config.tar.gz                             /etc/gitlab incl. gitlab-secrets.json + SSH host keys
+  stack/                                    .env, docker-compose.yml, Caddyfile
+  MANIFEST  SHA256SUMS
+```
 
 ```bash
-# set GITLAB_VERSION in .env to the version in the backup name, then:
-docker compose up -d
-tar -C /srv/gitlab -xzf /srv/gitlab/config-backups/config-<ver>-<stamp>.tgz   # restores gitlab-secrets.json
-docker compose exec gitlab gitlab-ctl stop puma
-docker compose exec gitlab gitlab-ctl stop sidekiq
-docker compose exec gitlab gitlab-backup restore BACKUP=<name without _gitlab_backup.tar>
-docker compose restart gitlab
-docker compose exec gitlab gitlab-rake gitlab:check SANITIZE=true
+sudo ./backup.sh                  # manual bundle; GitLab keeps serving
+sudo ./backup.sh --scheduled      # what the daily timer runs (02:15)
 ```
+
+**Retention:**
+- `scheduled` and `pre-upgrade` bundles: the newest `BACKUP_KEEP` (default 5) of each kind are kept.
+- `manual` and `migration` bundles are never deleted automatically.
+- A directory ending in `.partial` is an unfinished bundle and is safe to delete.
+
+**Copy bundles off the server.** A backup on the same disk is not a backup. Bundles contain secrets, so keep the target private:
+
+```bash
+rsync -aH /srv/gitlab/bundles/ backup-host:/backups/gitlab/
+```
+
+Run this from cron or a timer after 02:15. On the target, check a bundle with `cd <bundle> && sha256sum -c SHA256SUMS`.
+
+**Restore** (same or new server): `restore.sh` does the following:
+- verifies the checksums;
+- moves existing data aside;
+- restores `/etc/gitlab`;
+- starts the **exact** GitLab version of the bundle;
+- runs `gitlab-backup restore`;
+- verifies health, secrets, row counts and `gitlab:check`.
+
+```bash
+sudo ./restore.sh /srv/gitlab/bundles/gitlab-<...>           # refuses if data exists
+sudo ./restore.sh /srv/gitlab/bundles/gitlab-<...> --force   # replace; old data moved aside
+```
+
+Test a restore on a spare VM now and then. It is the only real proof that a backup works.
+
+## Migrating to a new server
+
+1. **Old server:** take a consistent final snapshot. Web and background jobs stay **stopped** afterwards, so nothing written after the snapshot is lost:
+   ```bash
+   sudo ./backup.sh --migrate
+   ```
+   ```bash
+   rsync -aH --info=progress2 /srv/gitlab/bundles/gitlab-<...>-migration root@NEW:/root/
+   ```
+2. **New server:** copy this directory over (e.g. `git clone`), then run:
+   ```bash
+   sudo ./install.sh --restore /root/gitlab-<...>-migration
+   ```
+   The first run copies `.env` from the bundle and stops so you can review it (update `PUBLIC_IP` if you use it). Run the same command again. It then:
+   - installs Docker;
+   - restores the bundle on its exact version and verifies it;
+   - starts Caddy and enables the timers.
+
+   Upgrade afterwards with `./upgrade.sh`, not during the move.
+3. Point DNS at the new server. Caddy gets a certificate on the first request. The SSH host keys are restored, so users see no host-key warning.
+4. Before the DNS switch you can still abort: `docker compose restart gitlab` on the old server resumes service there.
 
 ## Operations cheat-sheet
 

@@ -1,35 +1,47 @@
 #!/usr/bin/env bash
-# One-time setup of GitLab CE + Caddy on Ubuntu 22.04 / 24.04.
-# Run from this directory as root:  sudo ./install.sh [--redeploy]
+# Setup of GitLab CE + Caddy on Ubuntu 22.04 / 24.04.
+# Run from this directory as root:
+#   sudo ./install.sh                     fresh install, or re-run safely on an existing one
+#   sudo ./install.sh --redeploy          recreate containers (same pinned version, data kept)
+#   sudo ./install.sh --restore <bundle>  new server: install, then restore a backup bundle
 #
-# Safe to re-run: packages, Docker Engine, Compose and an already running
-# GitLab stack are detected and left alone; only missing pieces are installed.
-#   --redeploy   pull images and recreate the containers even if the stack is running
+# Safe to re-run: packages, Docker Engine, Compose and an already running GitLab
+# stack are detected and left alone. It never starts GitLab on data from another
+# version, on a changed GITLAB_HOME, or after a failed upgrade.
 set -euo pipefail
 
 cd "$(dirname "$(readlink -f "$0")")"
+. ./lib.sh
 
-REDEPLOY=0
-for a in "$@"; do
-  case "$a" in
+REDEPLOY=0 RESTORE_BUNDLE=""
+while (( $# )); do
+  case "$1" in
     --redeploy) REDEPLOY=1 ;;
-    -h|--help)  sed -n '2,7p' "$0"; exit 0 ;;
-    *) echo "unknown option: $a" >&2; exit 2 ;;
+    --restore)  [[ -n "${2:-}" ]] || die "--restore needs a bundle directory"; RESTORE_BUNDLE=$(readlink -f "$2"); shift ;;
+    -h|--help)  sed -n '2,10p' "$0"; exit 0 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
+  shift
 done
 
-log()  { printf '\n==> %s\n' "$*"; }
-skip() { printf '    [skip] %s\n' "$*"; }
-die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
-
-[[ $EUID -eq 0 ]] || die "run as root (sudo ./install.sh)"
+require_root
 . /etc/os-release
 [[ "${ID:-}" == "ubuntu" ]] || die "this script targets Ubuntu (found: ${ID:-unknown})"
 
-[[ -f .env ]] || { cp .env.example .env; die "created .env from template — edit it, then re-run"; }
-set -a; . ./.env; set +a
+if [[ ! -f .env ]]; then
+  if [[ -n "$RESTORE_BUNDLE" && -f "$RESTORE_BUNDLE/stack/.env" ]]; then
+    cp "$RESTORE_BUNDLE/stack/.env" .env; chmod 600 .env
+    echo "Copied .env from the bundle. Review it (GITLAB_DOMAIN, PUBLIC_IP, GITLAB_HOME), then re-run the same command."
+    exit 1
+  fi
+  cp .env.example .env; chmod 600 .env
+  die "created .env from template — edit it, then re-run"
+fi
+load_env
 [[ "$GITLAB_DOMAIN" != "sub.domain.com" ]] || die "set GITLAB_DOMAIN in .env"
 [[ "$ACME_EMAIL" != "admin@domain.com" ]] || die "set ACME_EMAIL in .env"
+[[ -z "$RESTORE_BUNDLE" || -d "$RESTORE_BUNDLE" ]] || die "bundle not found: $RESTORE_BUNDLE"
+take_lock
 
 # --- Prerequisites (install only what is missing) ---------------------------
 
@@ -166,8 +178,7 @@ check_dns() {
 
 # --- Existing deployments -----------------------------------------------------
 
-project=$(docker compose config --format json 2>/dev/null | jq -r '.name // empty')
-project=${project:-gitlab}
+project=$(compose_project)
 
 stack_running=0
 if [[ -n "$(docker compose ps -q --status running gitlab 2>/dev/null)" ]]; then
@@ -183,11 +194,7 @@ if [[ -n "$foreign" ]]; then
        Leaving it untouched. Stop/remove it first, or manage that deployment instead."
 fi
 
-if (( stack_running && ! REDEPLOY )); then
-  log "GitLab stack '$project' is already running; leaving containers untouched"
-  docker compose ps --format 'table {{.Service}}\t{{.Image}}\t{{.Status}}'
-  echo "    Use ./upgrade.sh to change versions, or ./install.sh --redeploy to pull and recreate."
-else
+prepare_host() {
   check_dns
   # Fail early if something other than this stack already holds the needed ports.
   if [[ -z "$(docker compose ps -q 2>/dev/null)" ]]; then
@@ -196,68 +203,96 @@ else
 $busy
        Stop that service (or put it behind Caddy) first."
   fi
-
   if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
     log "Opening firewall ports (ufw)"
     ufw allow 80/tcp; ufw allow 443/tcp; ufw allow 443/udp; ufw allow "${GITLAB_SSH_PORT}/tcp"
   fi
+  mkdir -p "$GITLAB_HOME"/{config,logs,data,caddy/data,caddy/config}
+  chmod 755 "$GITLAB_HOME"
+}
 
-  log "Creating data directories under $GITLAB_HOME"
-  mkdir -p "$GITLAB_HOME"/{config,logs,data}
+if [[ -n "$RESTORE_BUNDLE" ]]; then
+  # --- New server from a backup bundle ------------------------------------------
+  prepare_host
+  log "Restoring bundle $RESTORE_BUNDLE"
+  ./restore.sh "$RESTORE_BUNDLE" $( [[ -n "$(ls -A "$GITLAB_HOME/data" 2>/dev/null)" ]] && echo --force )
+  load_env      # restore.sh pinned GITLAB_VERSION to the bundle's version
+elif (( stack_running && ! REDEPLOY )); then
+  preflight
+  log "GitLab stack '$project' is already running; leaving containers untouched"
+  docker compose ps --format 'table {{.Service}}\t{{.Image}}\t{{.Status}}'
+  echo "    Use ./upgrade.sh to change versions, or ./install.sh --redeploy to recreate."
+else
+  # --- Fresh install, or start/recreate an existing one on the SAME version -----
+  preflight
+  dv=$(data_version)
+  if [[ -n "$dv" ]]; then
+    log "Existing GitLab $dv data found in $GITLAB_HOME/data; it will be reused as-is"
+  elif [[ -n "$(ls -A "$GITLAB_HOME/data" 2>/dev/null)" ]]; then
+    die "$GITLAB_HOME/data is not empty but has no GitLab VERSION file. Refusing to start on unknown data."
+  fi
+  prepare_host
 
+
+  migrate_caddy_volumes
   log "Starting GitLab $GITLAB_VERSION and Caddy"
-  docker compose pull
+  docker compose pull -q
   docker compose up -d
 fi
 
 log "Waiting for GitLab to become healthy (first boot takes 3-10 minutes)"
-status=starting
-for _ in $(seq 1 120); do
-  status=$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q gitlab)" 2>/dev/null || echo starting)
-  [[ "$status" == "healthy" ]] && break
-  sleep 10
-done
-[[ "$status" == "healthy" ]] || die "GitLab not healthy after 20 min — check: docker compose logs gitlab"
+rc=0; wait_healthy 30 || rc=$?
+(( rc == 0 )) || { explain_unhealthy "$rc"; die "GitLab is not healthy — check: docker compose logs gitlab"; }
+recreate_caddy
 
-# --- Weekly patch-upgrade timer (rewritten each run, so path changes apply) ---
+# --- Timers (rewritten each run, so path changes apply) -------------------------
 
-log "Installing weekly automatic patch-release updates (systemd timer)"
 install_dir=$(pwd)
-cat > /etc/systemd/system/gitlab-patch-upgrade.service <<EOF
+write_timer() {  # write_timer <name> <description> <OnCalendar> <command>
+  cat > "/etc/systemd/system/$1.service" <<UNIT
 [Unit]
-Description=Apply latest GitLab CE patch release (same minor version)
+Description=$2
 After=docker.service
 Requires=docker.service
 
 [Service]
 Type=oneshot
 WorkingDirectory=$install_dir
-ExecStart=$install_dir/upgrade.sh --patch-only --yes
-TimeoutStartSec=3h
-EOF
-cat > /etc/systemd/system/gitlab-patch-upgrade.timer <<'EOF'
+ExecStart=$4
+TimeoutStartSec=6h
+UNIT
+  cat > "/etc/systemd/system/$1.timer" <<UNIT
 [Unit]
-Description=Weekly GitLab CE patch upgrade
+Description=$2
 
 [Timer]
-OnCalendar=Sun *-*-* 03:30:00
+OnCalendar=$3
 RandomizedDelaySec=30m
 Persistent=true
 
 [Install]
 WantedBy=timers.target
-EOF
+UNIT
+}
+
+log "Installing timers: daily backup, weekly patch-release upgrade"
+write_timer gitlab-backup "Daily GitLab backup bundle" "*-*-* 02:15:00" "$install_dir/backup.sh --scheduled"
+write_timer gitlab-patch-upgrade "Apply latest GitLab CE patch release (same minor version)" "Sun *-*-* 03:30:00" "$install_dir/upgrade.sh --patch-only --yes"
 systemctl daemon-reload
-systemctl enable --now gitlab-patch-upgrade.timer
+systemctl enable --now gitlab-backup.timer gitlab-patch-upgrade.timer
 
 cat <<EOF
 
 GitLab is up:  https://$GITLAB_DOMAIN
 Git over SSH:  ssh://git@$GITLAB_DOMAIN:$GITLAB_SSH_PORT/<group>/<project>.git
+Backups:       $BACKUP_DIR  (daily; copy them OFF this server)
+EOF
+if pw=$(docker compose exec -T gitlab grep 'Password:' /etc/gitlab/initial_root_password 2>/dev/null); then
+  cat <<EOF
 
 Log in as 'root'. The initial password (auto-deleted after 24h) is:
-  $(docker compose exec -T gitlab grep 'Password:' /etc/gitlab/initial_root_password 2>/dev/null || echo "(already removed)")
-
+  $pw
 Change it right away, and turn off public sign-up if not needed:
   Admin > Settings > General > Sign-up restrictions.
 EOF
+fi
